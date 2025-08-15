@@ -17,9 +17,7 @@ esphome:
   friendly_name: B Route Meter
   platformio_options:
     build_flags:
-    - -std=gnu++17 -Wall -Wextra
-    build_unflags:
-    - -std=gnu++11
+    - -Wall -Wextra
 external_components:
 - source: github://homy-newfs8/esphome-broute@v0.1.1
   components: [ b_route ]
