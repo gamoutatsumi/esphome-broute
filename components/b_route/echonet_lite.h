@@ -90,7 +90,7 @@ class Codec {
 		write_eoj(deoj, dest, N, written);
 		// ESV
 		if (N >= written + 1) {
-			*dest++ = std::byte{ESV::Get};
+			*dest++ = std::byte{static_cast<uint8_t>(ESV::Get)};
 		}
 		written += 1;
 		int cnt = 0;

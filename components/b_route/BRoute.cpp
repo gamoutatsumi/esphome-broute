@@ -456,14 +456,14 @@ BRoute::loop() {
 			}
 			if (rescan_timeout && is_measurement_requesting()) {
 				if (auto elapsed = esphome::millis() - rescan_timer; elapsed > rescan_timeout) {
-					ESP_LOGE(TAG, u8"計測データを %u 秒間受信していません。再スキャンします", elapsed / 1000);
+					ESP_LOGE(TAG, "計測データを %lu 秒間受信していません。再スキャンします", elapsed / 1000);
 					start_scan();
 					break;
 				}
 			}
 			if (rejoin_timeout && is_measurement_requesting()) {
 				if (auto elapsed = esphome::millis() - rejoin_timer; elapsed > rejoin_timeout) {
-					ESP_LOGI(TAG, u8"計測データを %u 秒間受信していません。再接続します", elapsed / 1000);
+					ESP_LOGI(TAG, "計測データを %lu 秒間受信していません。再接続します", elapsed / 1000);
 					start_join();
 					break;
 				}
@@ -475,7 +475,7 @@ BRoute::loop() {
 	}
 	if (reboot_timeout && is_measurement_requesting()) {
 		if (auto elapsed = esphome::millis() - reboot_timer; elapsed > reboot_timeout) {
-			ESP_LOGE(TAG, u8"計測データを %u 秒間受信していません。再起動します", elapsed / 1000);
+			ESP_LOGE(TAG, "計測データを %lu 秒間受信していません。再起動します", elapsed / 1000);
 			set_state(state_t::restarting, 0);
 			return;
 		}
