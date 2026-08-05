@@ -2,20 +2,24 @@
 #include <esphome/components/sensor/sensor.h>
 #include <esphome/components/uart/uart.h>
 #include <esphome/core/component.h>
+#include <array>
 #include <cmath>
-#include "bp35cmd.h"
+#include <cstdint>
 #include "echonet_lite.h"
-#include "libbp35.h"
+#include "j11.h"
 
 namespace esphome {
 namespace b_route {
 
 using echonet_lite::EOJ;
 
-class BRoute : public Component, public uart::UARTDevice, public libbp35::SerialIO {
+class BRoute : public Component, public uart::UARTDevice, public j11::SerialIO {
  public:
 	BRoute();
+
 	virtual void loop() override;
+	virtual void setup() override;
+
 	void set_power_sensor(sensor::Sensor* sensor) { power_sensor = sensor; }
 	void set_energy_sensor(sensor::Sensor* sensor) { energy_sensor = sensor; }
 	void set_power_sensor_interval_sec(uint32_t interval) { power_sensor_interval = interval * 1000; }
@@ -29,48 +33,43 @@ class BRoute : public Component, public uart::UARTDevice, public libbp35::Serial
 		rb_password = password;
 	}
 
-	virtual size_t write(char c) override {
-		write_byte(c);
-		return 1;
-	}
-	virtual size_t write(const char* str) override {
-		size_t len = std::strlen(str);
-		write_array(reinterpret_cast<const uint8_t*>(str), len);
+	// j11::SerialIO
+	virtual size_t write(const uint8_t* data, size_t len) override {
+		write_array(data, len);
 		return len;
 	}
-	virtual size_t write(const char* data, size_t len) override {
-		write_array(reinterpret_cast<const uint8_t*>(data), len);
-		return len;
-	}
-
 	virtual int read() override {
 		if (available() < 1) {
 			return -1;
 		}
 		uint8_t b;
-		if (read_byte(&b)) {
-			return b;
-		} else {
-			return -1;
-		}
+		return read_byte(&b) ? b : -1;
 	}
 
  private:
 	static constexpr EOJ EOJ_CONTROLLER{0x05, 0xff, 0x01};
 	static constexpr EOJ EOJ_LOWV_SMART_METER{0x02, 0x88, 0x01};
 	static constexpr uint32_t REQUEST_PROPERTY_INTERVAL = 5'000;
+	static constexpr uint16_t UDP_PORT_ECHONET = echonet_lite::UDP_PORT;  // 3610
 	static constexpr const char* TAG = "b_route";
 
-	enum class initial_value_t { pwd, rbid, panid, channel, ropt, wopt, echo } setting_value = initial_value_t::pwd;
-	enum class state_t { init, wait_ver, setting_values, scanning, joining, running, addr_conv, restarting } state = state_t::init;
+	enum class state_t {
+		init,
+		set_mode,      // 初期設定 (Dual, channel = stored)
+		set_auth,      // Bルート PANA 認証情報設定
+		scan,          // アクティブスキャン実行
+		set_channel,   // 初期設定 (Dual, scanned channel)
+		broute_start,  // Bルート 動作開始
+		open_udp,      // UDP ポート OPEN (3610)
+		pana_start,    // Bルート PANA 開始 (accept)
+		pana_wait,     // PANA 認証結果通知 (0x6028) 待ち
+		running,
+		restarting,
+	} state = state_t::init;
 
-	libbp35::BP35 bp{*this};
+	j11::Driver driver{*this};
 	sensor::Sensor* power_sensor = nullptr;
 	sensor::Sensor* energy_sensor = nullptr;
-	std::string v6_address;
-	std::string channel;
-	std::string panid;
-	std::string mac;
 	const char* rb_password = nullptr;
 	const char* rb_id = nullptr;
 
@@ -90,54 +89,44 @@ class BRoute : public Component, public uart::UARTDevice, public libbp35::Serial
 	uint32_t reboot_timeout = 0;
 	uint8_t rejoin_miss_count = 0;
 
-	void set_state(state_t state, uint32_t timeout);
-	void start_join();
-	void start_scan();
-	void handle_rxudp(std::string_view);
+	uint8_t channel = j11::CHANNEL_UNSPEC;  // smart meter channel (scanned)
+	uint8_t meter_mac[8] = {0};
+	uint8_t meter_ipv6[16] = {0};
+	bool channel_found = false;
+	bool request_sent = false;    // current state already sent its request
+	bool need_scan_ = true;       // perform active scan during connection
+	bool awaiting_boot_ = false;  // waiting for boot-complete after HW reset
+	uint16_t expected_resp = 0;   // response command code awaited by simple states
+
+	std::array<std::byte, 255> out_buffer{};
+	std::array<uint8_t, 64> tx_buffer{};
+
+	void set_state(state_t state, uint32_t timeout = 0);
+	void restart_connection(bool with_scan);  // HW reset → boot → reconnect (rescan when true)
+	static const char* state_name(state_t);
+
+	bool handle_simple_response(const j11::Frame& frame, state_t ok_state);
+	bool send_initial_setting(uint8_t channel);
+	bool send_broute_auth();
+	bool send_active_scan();
+	bool send_broute_start();
+	bool send_udp_open();
+	bool send_pana_start();
+
+	template <size_t N>
+	bool request_property_impl(std::array<uint8_t, N> props);
+
+	void handle_data_rx(const j11::Frame& frame);
 	void handle_property_response(const std::byte* data, const echonet_lite::Packet& pkt);
 	void request_momentary_power();
 	void request_integral_energy();
 	void request_energy_parameters();
-	bool test_nw_info() const;
 	bool energy_params_received() const { return std::isfinite(energy_unit) && energy_coeff > 0; }
-	libbp35::event_t get_event(libbp35::event_params_t& params);
-	virtual void setup() override;
-	std::array<std::byte, 255> out_buffer{};
+	void reset_timers() { rejoin_timer = rescan_timer = reboot_timer = esphome::millis(); }
 	bool is_measurement_requesting() const {
 		return (power_sensor && power_sensor_interval > 0 && power_sensor_interval != esphome::SCHEDULER_DONT_RUN) ||
 		       (energy_sensor && energy_sensor_interval > 0 && energy_sensor_interval != esphome::SCHEDULER_DONT_RUN);
 	}
-	void reset_timers() { rejoin_timer = rescan_timer = reboot_timer = esphome::millis(); }
-
-	template <size_t N>
-	bool request_property(std::array<uint8_t, N> props) {
-		using namespace libbp35::cmd;
-		namespace echo = echonet_lite;
-		if (state != state_t::running) {
-			return false;
-		}
-		if (rejoin_miss_count && miss_count >= rejoin_miss_count) {
-			ESP_LOGW(TAG, "Data not received for %u times, rejoin to meter", miss_count);
-			miss_count = 0;
-			start_join();
-			return false;
-		}
-		if (property_requested && millis() - property_requested < REQUEST_PROPERTY_INTERVAL) {
-			return false;
-		}
-		size_t len = echo::Codec::encode_property_get(out_buffer, EOJ_CONTROLLER, EOJ_LOWV_SMART_METER, props);
-		if (len > std::size(out_buffer)) {
-			ESP_LOGE(TAG, "Get property encode overflow");
-			return false;
-		}
-		bp.send_sk_with_data("SKSENDTO", out_buffer.data(), len, arg::mode(1), arg::str(v6_address), arg::num16(echo::UDP_PORT),
-		                     arg::mode(2), arg::num16(len));
-		property_requested = millis();
-		++miss_count;
-		return true;
-	}
-
-	static const char* state_name(state_t);
 };
 
 }  // namespace b_route

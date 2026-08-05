@@ -5,7 +5,7 @@
 # 必要なもの
 
 * [ESPHome](https://esphome.io/)が動作するマイコン(ESP32シリーズ等)
-* [SKSTACK IP for HAN](https://www.skyley.com/wiki/?SKSTACK+IP+for+HAN)、Bルート対応でマイコンにUART接続可能なWi-SUNモジュール(Rohm社 BP35A1+BP35A7Aで動作確認)
+* [SKSTACK IP for HAN](https://www.skyley.com/wiki/?SKSTACK+IP+for+HAN)、Bルート対応でマイコンにUART接続可能なWi-SUNモジュール(Rohm社 BP35C1-J11-T01 対応。J11 UART IFバイナリプロトコルを使用)
 
 # ESPHome への本コンポーネントの導入
 

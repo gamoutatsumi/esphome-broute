@@ -3,93 +3,99 @@
 #include <cmath>
 #include <cstring>
 #include "echonet_lite.h"
-#include "util.h"
 
 namespace esphome::b_route {
 
-using namespace libbp35::cmd;
-using libbp35::BP35;
-using libbp35::event_params_t;
-using libbp35::event_t;
-using libbp35::rxudp_t;
+using j11::Driver;
+using j11::Frame;
+namespace cmd = j11::req;
+namespace notif = j11::notif;
 namespace echo = echonet_lite;
 namespace meter = echonet_lite::props::lowv_smart_meter;
 
 namespace {
 
-std::array<std::byte, 255> buffer{};
-constexpr std::array PROPS_MOMENTARY_POWER{meter::MOMENTARY_POWER};
-constexpr std::array PROPS_ENERGY_PARAMS{meter::ENERGY_COEFF, meter::ENERGY_UNIT};
-constexpr std::array PROPS_INTEGRAL_ENERGY{meter::INTEGRAL_ENERGY_FWD};
+constexpr uint32_t BOOT_WAIT = 3'000;
+constexpr uint32_t RESP_TIMEOUT = 5'000;
+constexpr uint32_t SCAN_TIMEOUT = 30'000;
+constexpr uint32_t BROUTE_START_TIMEOUT = 10'000;
+constexpr uint32_t PANA_RESULT_TIMEOUT = 120'000;
+constexpr uint32_t RESTART_DELAY = 5'000;
 
 constexpr uint32_t SEND_RETRY_INTERVAL = 2'000;
 constexpr uint32_t REQUEST_RETRY_INTERVAL = 5'000;
-constexpr uint32_t RESTART_DELAY = 5'000;
+
+constexpr uint8_t SCAN_TIME = 0x06;
+// Channels 4..17 → bits 4..17 set = 0x0003FFF0 (big endian)
+constexpr uint8_t SCAN_CHANNELS[4] = {0x00, 0x03, 0xFF, 0xF0};
 
 constexpr const char* power_task = "power";
 constexpr const char* energy_task = "energy";
 constexpr const char* params_task = "params";
 
-constexpr std::string_view SCAN_KEY_ADDR = "Addr:";
-constexpr std::string_view SCAN_KEY_PANID = "Pan ID:";
-constexpr std::string_view SCAN_KEY_CHANNEL = "Channel:";
+constexpr std::array PROPS_MOMENTARY_POWER{meter::MOMENTARY_POWER};
+constexpr std::array PROPS_ENERGY_PARAMS{meter::ENERGY_COEFF, meter::ENERGY_UNIT};
+constexpr std::array PROPS_INTEGRAL_ENERGY{meter::INTEGRAL_ENERGY_FWD};
+
+uint16_t
+be16(const uint8_t* p) {
+	return (static_cast<uint16_t>(p[0]) << 8) | p[1];
+}
 
 }  // namespace
 
 BRoute::BRoute() {}
 
-void
-BRoute::request_energy_parameters() {
-	auto rc = request_property(PROPS_ENERGY_PARAMS);
-	if (rc) {
-		ESP_LOGD(TAG, "Energy params requested");
+const char*
+BRoute::state_name(state_t s) {
+	switch (s) {
+		case state_t::init:
+			return "init";
+		case state_t::set_mode:
+			return "set_mode";
+		case state_t::set_auth:
+			return "set_auth";
+		case state_t::scan:
+			return "scan";
+		case state_t::set_channel:
+			return "set_channel";
+		case state_t::broute_start:
+			return "broute_start";
+		case state_t::open_udp:
+			return "open_udp";
+		case state_t::pana_start:
+			return "pana_start";
+		case state_t::pana_wait:
+			return "pana_wait";
+		case state_t::running:
+			return "running";
+		case state_t::restarting:
+			return "restarting";
+		default:
+			return "unknown";
 	}
-	App.scheduler.set_timeout(this, params_task, rc ? REQUEST_RETRY_INTERVAL : SEND_RETRY_INTERVAL,
-	                          [this] { request_energy_parameters(); });
 }
 
 void
-BRoute::request_momentary_power() {
-	auto rc = request_property(PROPS_MOMENTARY_POWER);
-	if (rc) {
-		ESP_LOGD(TAG, "POWER requested");
+BRoute::set_state(state_t s, uint32_t timeout) {
+	if (state == state_t::restarting) {
+		return;
 	}
-	App.scheduler.set_timeout(this, power_task, rc ? REQUEST_RETRY_INTERVAL : SEND_RETRY_INTERVAL,
-	                          [this] { request_momentary_power(); });
-}
-
-void
-BRoute::request_integral_energy() {
-	auto rc = energy_params_received() && request_property(PROPS_INTEGRAL_ENERGY);
-	if (rc) {
-		ESP_LOGD(TAG, "ENERGY requested");
-	}
-	App.scheduler.set_timeout(this, energy_task, rc ? REQUEST_RETRY_INTERVAL : SEND_RETRY_INTERVAL,
-	                          [this] { request_integral_energy(); });
-}
-
-bool
-BRoute::test_nw_info() const {
-	ESP_LOGD(TAG, "scan data: mac=%s, panid=%s, channel=%s", mac.c_str(), panid.c_str(), channel.c_str());
-	if (mac.empty() && panid.empty() && channel.empty()) {
-		return false;
-	}
-	if (mac.length() != 16 || panid.length() != 4 || channel.length() != 2) {
-		ESP_LOGE(TAG, "Unexpected scan data: mac=%s, panid=%s, channel=%s", mac.c_str(), panid.c_str(), channel.c_str());
-		return false;
-	}
-	return true;
+	state = s;
+	state_timeout = timeout;
+	state_started = esphome::millis();
+	request_sent = false;
 }
 
 void
 BRoute::setup() {
-	if (parent_ == nullptr) {
-		ESP_LOGE(TAG, "No serial specified");
+	if (rb_id == nullptr || rb_password == nullptr) {
+		ESP_LOGE(TAG, "Route B ID/Password not set");
 		mark_failed();
 		return;
 	}
-	if (rb_id == nullptr || rb_password == nullptr) {
-		ESP_LOGE(TAG, "Route B ID/Password not set");
+	if (std::strlen(rb_id) != 32) {
+		ESP_LOGE(TAG, "Route B ID must be 32 chars");
 		mark_failed();
 		return;
 	}
@@ -103,6 +109,161 @@ BRoute::setup() {
 		set_interval(energy_sensor_interval, [this] { request_integral_energy(); });
 	}
 	reset_timers();
+}
+
+bool
+BRoute::send_initial_setting(uint8_t ch) {
+	const uint8_t data[4] = {j11::MODE_DUAL, j11::HAN_SLEEP_DISABLE, ch, j11::TX_POWER_20MW};
+	ESP_LOGD(TAG, "INITIAL_SETTING channel=%02X", ch);
+	return driver.send_request(cmd::INITIAL_SETTING, data, sizeof(data));
+}
+
+bool
+BRoute::send_broute_auth() {
+	uint8_t data[44];
+	std::memcpy(data, rb_id, 32);
+	size_t pwlen = std::strlen(rb_password);
+	if (pwlen > 12) {
+		pwlen = 12;
+	}
+	std::memcpy(data + 32, rb_password, pwlen);
+	std::memset(data + 32 + pwlen, 0, 12 - pwlen);
+	ESP_LOGD(TAG, "BROUTE_SET_AUTH");
+	return driver.send_request(cmd::BROUTE_SET_AUTH, data, sizeof(data));
+}
+
+bool
+BRoute::send_active_scan() {
+	uint8_t data[1 + 4 + 1 + 8];
+	data[0] = SCAN_TIME;
+	std::memcpy(&data[1], SCAN_CHANNELS, 4);
+	data[5] = 0x01;                        // Paring ID あり
+	std::memcpy(&data[6], rb_id + 24, 8);  // Bルート認証ID 末尾8文字
+	channel_found = false;
+	ESP_LOGD(TAG, "ACTIVE_SCAN");
+	return driver.send_request(cmd::ACTIVE_SCAN, data, sizeof(data));
+}
+
+bool
+BRoute::send_broute_start() {
+	ESP_LOGD(TAG, "BROUTE_START");
+	return driver.send_request(cmd::BROUTE_START);
+}
+
+bool
+BRoute::send_udp_open() {
+	const uint8_t data[2] = {static_cast<uint8_t>(UDP_PORT_ECHONET >> 8), static_cast<uint8_t>(UDP_PORT_ECHONET & 0xFF)};
+	ESP_LOGD(TAG, "UDP_PORT_OPEN %u", UDP_PORT_ECHONET);
+	return driver.send_request(cmd::UDP_PORT_OPEN, data, sizeof(data));
+}
+
+bool
+BRoute::send_pana_start() {
+	ESP_LOGD(TAG, "BROUTE_PANA_START");
+	return driver.send_request(cmd::BROUTE_PANA_START);
+}
+
+void
+BRoute::restart_connection(bool with_scan) {
+	ESP_LOGW(TAG, "Reconnect (rescan=%d)", with_scan ? 1 : 0);
+	need_scan_ = with_scan;
+	if (with_scan) {
+		channel = j11::CHANNEL_UNSPEC;
+		channel_found = false;
+	}
+	driver.reset_rx();
+	awaiting_boot_ = true;
+	// ソフトウェアリセット → 起動完了通知(0x6019)待ち → 初期設定から再開
+	driver.send_request(cmd::HW_RESET);
+	set_state(state_t::init, BOOT_WAIT);
+}
+
+bool
+BRoute::handle_simple_response(const Frame& frame, state_t ok_state) {
+	if (frame.command != expected_resp) {
+		return false;
+	}
+	if (frame.result() == j11::RESULT_OK) {
+		set_state(ok_state);
+		return true;
+	}
+	ESP_LOGE(TAG, "%s: result=%02X", state_name(state), frame.result());
+	restart_connection(false);
+	return true;
+}
+
+template <size_t N>
+bool
+BRoute::request_property_impl(std::array<uint8_t, N> props) {
+	if (state != state_t::running) {
+		return false;
+	}
+	if (rejoin_miss_count && miss_count >= rejoin_miss_count) {
+		ESP_LOGW(TAG, "No response for %u requests, reconnect", miss_count);
+		miss_count = 0;
+		restart_connection(false);
+		return false;
+	}
+	if (property_requested && esphome::millis() - property_requested < REQUEST_PROPERTY_INTERVAL) {
+		return false;
+	}
+	size_t elen = echo::Codec::encode_property_get(out_buffer, EOJ_CONTROLLER, EOJ_LOWV_SMART_METER, props);
+	if (elen > std::size(out_buffer)) {
+		ESP_LOGE(TAG, "Get property encode overflow");
+		return false;
+	}
+	// SEND_DATA payload: dst_ipv6(16) + src_port(2) + dst_port(2) + size(2) + data
+	constexpr size_t HDR = 16 + 2 + 2 + 2;
+	if (HDR + elen > std::size(tx_buffer)) {
+		return false;
+	}
+	size_t p = 0;
+	std::memcpy(&tx_buffer[p], meter_ipv6, 16);
+	p += 16;
+	tx_buffer[p++] = static_cast<uint8_t>(UDP_PORT_ECHONET >> 8);
+	tx_buffer[p++] = static_cast<uint8_t>(UDP_PORT_ECHONET & 0xFF);
+	tx_buffer[p++] = static_cast<uint8_t>(UDP_PORT_ECHONET >> 8);
+	tx_buffer[p++] = static_cast<uint8_t>(UDP_PORT_ECHONET & 0xFF);
+	tx_buffer[p++] = static_cast<uint8_t>(elen >> 8);
+	tx_buffer[p++] = static_cast<uint8_t>(elen & 0xFF);
+	std::memcpy(&tx_buffer[p], out_buffer.data(), elen);
+	p += elen;
+	if (!driver.send_request(cmd::SEND_DATA, tx_buffer.data(), p)) {
+		return false;
+	}
+	property_requested = esphome::millis();
+	++miss_count;
+	return true;
+}
+
+void
+BRoute::request_energy_parameters() {
+	auto rc = request_property_impl(PROPS_ENERGY_PARAMS);
+	if (rc) {
+		ESP_LOGD(TAG, "Energy params requested");
+	}
+	App.scheduler.set_timeout(this, params_task, rc ? REQUEST_RETRY_INTERVAL : SEND_RETRY_INTERVAL,
+	                          [this] { request_energy_parameters(); });
+}
+
+void
+BRoute::request_momentary_power() {
+	auto rc = request_property_impl(PROPS_MOMENTARY_POWER);
+	if (rc) {
+		ESP_LOGD(TAG, "POWER requested");
+	}
+	App.scheduler.set_timeout(this, power_task, rc ? REQUEST_RETRY_INTERVAL : SEND_RETRY_INTERVAL,
+	                          [this] { request_momentary_power(); });
+}
+
+void
+BRoute::request_integral_energy() {
+	auto rc = energy_params_received() && request_property_impl(PROPS_INTEGRAL_ENERGY);
+	if (rc) {
+		ESP_LOGD(TAG, "ENERGY requested");
+	}
+	App.scheduler.set_timeout(this, energy_task, rc ? REQUEST_RETRY_INTERVAL : SEND_RETRY_INTERVAL,
+	                          [this] { request_integral_energy(); });
 }
 
 void
@@ -201,288 +362,249 @@ BRoute::handle_property_response(const std::byte* raw, const echo::Packet& pkt) 
 	}
 }
 
-const char*
-BRoute::state_name(state_t state) {
-	switch (state) {
-		case state_t::init:
-			return "init";
-		case state_t::joining:
-			return "joining";
-		case state_t::running:
-			return "running";
-		case state_t::scanning:
-			return "scanning";
-		case state_t::setting_values:
-			return "settings";
-		case state_t::wait_ver:
-			return "ver";
-		case state_t::addr_conv:
-			return "addr_conv";
-		case state_t::restarting:
-			return "restarting";
-		default:
-			return "unknown";
-	}
-}
-
 void
-BRoute::set_state(state_t state, uint32_t timeout) {
-	if (this->state == state_t::restarting) {
+BRoute::handle_data_rx(const Frame& frame) {
+	// 0x6018: sender_ipv6(16) + srcport(2) + dstport(2) + panid(2) + addrtype(1) + enc(1) + rssi(1) + size(2) + data
+	constexpr size_t HDR = 16 + 2 + 2 + 2 + 1 + 1 + 1 + 2;
+	if (frame.data_len < HDR) {
+		ESP_LOGW(TAG, "DATA_RX too short");
 		return;
 	}
-	this->state = state;
-	state_timeout = timeout;
-	state_started = esphome::millis();
-}
-
-void
-BRoute::start_join() {
-	bp.send_sk("SKJOIN", arg::str(v6_address));
-	set_state(state_t::joining, 10'000);
-}
-
-void
-BRoute::start_scan() {
-	mac.clear();
-	panid.clear();
-	channel.clear();
-	bp.send_sk("SKSCAN 2 FFFFFFFF 6");
-	set_state(state_t::scanning, 20'000);
-}
-
-void
-BRoute::handle_rxudp(std::string_view hexstr) {
-	ESP_LOGV(TAG, "RXUDP: %s", hexstr.data());
-	auto start = esphome::millis();
-	rxudp_t rxudp;
-	if (!BP35::parse_rxudp(hexstr, rxudp)) {
-		ESP_LOGW(TAG, "%s: Failed to parse rxudp, skipped", hexstr.data());
+	const uint16_t dst_port = be16(frame.data + 18);
+	if (dst_port != UDP_PORT_ECHONET) {
+		ESP_LOGD(TAG, "DATA_RX port %u not for ECHONET", dst_port);
 		return;
 	}
-	if (rxudp.lport != echo::UDP_PORT) {
-		ESP_LOGD(TAG, "%u: Destination port is not for EchonetLite", rxudp.lport);
+	const size_t dsize = be16(frame.data + 25);
+	if (HDR + dsize > frame.data_len) {
+		ESP_LOGW(TAG, "DATA_RX size mismatch");
 		return;
 	}
-	ESP_LOGV(TAG, "udp data len = %u, datastr = %s", rxudp.data_len, hexstr.data() + rxudp.data_pos);
-	size_t len;
-	if (!util::hex2bin(&hexstr[rxudp.data_pos], buffer, len) || len != rxudp.data_len) {
-		ESP_LOGW(TAG, "%s: Failed to decode udp data", &hexstr[rxudp.data_pos]);
-		return;
-	}
+	const auto* raw = reinterpret_cast<const std::byte*>(frame.data + HDR);
 	echo::Packet pkt;
-	if (!echo::Codec::decode_packet(buffer.data(), len, pkt)) {
-		ESP_LOGW(TAG, "%s: Failed to decode echonet packet", &hexstr[rxudp.data_pos]);
+	if (!echo::Codec::decode_packet(raw, dsize, pkt)) {
+		ESP_LOGW(TAG, "Failed to decode echonet packet");
 		return;
 	}
 	if (pkt.ehd1 != echo::EHD1 || pkt.ehd2 != echo::EHD2_Format1) {
 		return;
 	}
-	// handle low power smart meter
-	if (pkt.seoj.X1 != 0x02 || pkt.seoj.X2 != 0x88) {
+	if (pkt.seoj.X1 != 0x02 || pkt.seoj.X2 != 0x88) {  // low voltage smart meter
 		return;
 	}
-	ESP_LOGV(TAG, "Echonet ehd=%02x,%02x deoj=%02x%02x%02x, esv=%02x, npc=%u, epc[0]=%02x", pkt.ehd1, pkt.ehd2, pkt.deoj.X1,
-	         pkt.deoj.X2, pkt.deoj.X3, pkt.esv, pkt.opc, pkt.opc == 0 ? -1 : pkt.properties[0].epc);
 	if (pkt.esv == static_cast<uint8_t>(echo::ESV::Get_Res) || pkt.esv == static_cast<uint8_t>(echo::ESV::INF) ||
 	    pkt.esv == static_cast<uint8_t>(echo::ESV::Get_SNA)) {
-		handle_property_response(buffer.data(), pkt);
+		handle_property_response(raw, pkt);
 	}
-}
-
-libbp35::event_t
-BRoute::get_event(event_params_t& params) {
-	auto ev = bp.get_event(100, params);
-	if (ev != event_t::none) {
-		if (ev == event_t::event) {
-			ESP_LOGV(TAG, "ev = %s(%s)", libbp35::event_str(ev), libbp35::event_num_str(params.event.num));
-		} else {
-			ESP_LOGV(TAG, "ev = %s, line=%s", libbp35::event_str(ev), params.line.c_str());
-		}
-	}
-	return ev;
 }
 
 void
 BRoute::loop() {
-	event_params_t params{};
-	auto ev = get_event(params);
+	Frame frame;
+	const bool have = driver.read_frame(frame, 100);
+	if (have) {
+		if (frame.is_error()) {
+			ESP_LOGW(TAG, "Error frame %04X", frame.command);
+		} else {
+			ESP_LOGV(TAG, "frame %04X (%u bytes)", frame.command, frame.data_len);
+		}
+	}
+
 	switch (state) {
+		case state_t::init:
+			if (!awaiting_boot_) {
+				set_state(state_t::set_mode);
+				break;
+			}
+			if (have && frame.command == notif::BOOT_COMPLETE) {
+				ESP_LOGI(TAG, "Module booted");
+				set_state(state_t::set_mode);
+			}
+			break;
+		case state_t::set_mode:
+			if (!request_sent) {
+				expected_resp = cmd::INITIAL_SETTING | 0x2000;
+				if (send_initial_setting(channel)) {
+					request_sent = true;
+					set_state(state_t::set_mode, RESP_TIMEOUT);
+				}
+			} else if (have) {
+				handle_simple_response(frame, state_t::set_auth);
+			}
+			break;
+		case state_t::set_auth:
+			if (!request_sent) {
+				expected_resp = cmd::BROUTE_SET_AUTH | 0x2000;
+				if (send_broute_auth()) {
+					request_sent = true;
+					set_state(state_t::set_auth, RESP_TIMEOUT);
+				}
+			} else if (have) {
+				handle_simple_response(frame, need_scan_ ? state_t::scan : state_t::broute_start);
+			}
+			break;
+		case state_t::scan: {
+			if (!request_sent) {
+				if (send_active_scan()) {
+					request_sent = true;
+					set_state(state_t::scan, SCAN_TIMEOUT);
+				}
+				break;
+			}
+			if (!have) {
+				break;
+			}
+			if (frame.command == notif::SCAN_RESULT) {
+				// スキャン結果(0x4051): 結果(1) [, チャネル(1), スキャン数(1), [MAC(8),PANID(2),RSSI(1)]*n]
+				if (frame.data_len >= 1 && frame.data[0] == 0x00 && frame.data_len >= 2) {
+					channel = frame.data[1];
+					channel_found = true;
+					ESP_LOGI(TAG, "Scan: meter found on channel %u", channel);
+				}
+			} else if (frame.command == (cmd::ACTIVE_SCAN | 0x2000)) {
+				if (channel_found) {
+					set_state(state_t::set_channel);
+				} else {
+					ESP_LOGW(TAG, "Scan done but no meter found, retry");
+					request_sent = false;  // re-send scan
+				}
+			}
+			break;
+		}
+		case state_t::set_channel:
+			if (!request_sent) {
+				expected_resp = cmd::INITIAL_SETTING | 0x2000;
+				if (send_initial_setting(channel)) {
+					request_sent = true;
+					set_state(state_t::set_channel, RESP_TIMEOUT);
+				}
+			} else if (have) {
+				handle_simple_response(frame, state_t::broute_start);
+			}
+			break;
+		case state_t::broute_start:
+			if (!request_sent) {
+				expected_resp = cmd::BROUTE_START | 0x2000;
+				if (send_broute_start()) {
+					request_sent = true;
+					set_state(state_t::broute_start, BROUTE_START_TIMEOUT);
+				}
+			} else if (have && frame.command == expected_resp) {
+				if (frame.result() == j11::RESULT_OK) {
+					// 応答: 結果(1) + チャネル(1) + PANID(2) + MAC(8) + RSSI(1)
+					if (frame.data_len >= 12) {
+						channel = frame.data[1];
+						std::memcpy(meter_mac, frame.data + 4, 8);
+						j11::mac_to_ipv6(meter_mac, meter_ipv6);
+						ESP_LOGI(TAG, "B-route started: channel=%u", channel);
+					}
+					set_state(state_t::open_udp);
+				} else {
+					ESP_LOGE(TAG, "BROUTE_START result=%02X", frame.result());
+					// チャネル不正の可能性 → 再スキャン
+					restart_connection(true);
+				}
+			}
+			break;
+		case state_t::open_udp:
+			if (!request_sent) {
+				expected_resp = cmd::UDP_PORT_OPEN | 0x2000;
+				if (send_udp_open()) {
+					request_sent = true;
+					set_state(state_t::open_udp, RESP_TIMEOUT);
+				}
+			} else if (have) {
+				handle_simple_response(frame, state_t::pana_start);
+			}
+			break;
+		case state_t::pana_start:
+			if (!request_sent) {
+				expected_resp = cmd::BROUTE_PANA_START | 0x2000;
+				if (send_pana_start()) {
+					request_sent = true;
+					set_state(state_t::pana_start, RESP_TIMEOUT);
+				}
+			} else if (have) {
+				handle_simple_response(frame, state_t::pana_wait);
+			}
+			break;
+		case state_t::pana_wait:
+			if (have && frame.command == notif::PANA_RESULT) {
+				if (frame.data_len >= 1 && frame.data[0] == j11::PANA_SUCCESS) {
+					ESP_LOGI(TAG, "PANA authentication succeeded");
+					set_state(state_t::running, 0);
+					reset_timers();
+				} else {
+					ESP_LOGE(TAG, "PANA authentication failed (%02X)", frame.data_len >= 1 ? frame.data[0] : 0);
+					restart_connection(true);
+				}
+			}
+			break;
+		case state_t::running:
+			if (have) {
+				switch (frame.command) {
+					case cmd::SEND_DATA | 0x2000:
+						if (frame.result() != j11::RESULT_OK) {
+							ESP_LOGW(TAG, "SEND_DATA result=%02X", frame.result());
+						}
+						break;
+					case notif::DATA_RX:
+						handle_data_rx(frame);
+						break;
+					case notif::CONN_STATE:
+						if (frame.data_len >= 1) {
+							uint8_t cs = frame.data[0];
+							ESP_LOGW(TAG, "Connection state change: %02X", cs);
+							if (cs == j11::CONN_PANA_DISC || cs == j11::CONN_MAC_DISC) {
+								restart_connection(false);
+							}
+						}
+						break;
+					case notif::PKT_RX_FAIL:
+						ESP_LOGD(TAG, "Packet receive failure");
+						break;
+					default:
+						break;
+				}
+			}
+			if (is_measurement_requesting()) {
+				if (rescan_timeout && esphome::millis() - rescan_timer > rescan_timeout) {
+					ESP_LOGE(TAG, "計測データを %lu 秒間受信していません。再スキャンします", (esphome::millis() - rescan_timer) / 1000);
+					restart_connection(true);
+					break;
+				}
+				if (rejoin_timeout && esphome::millis() - rejoin_timer > rejoin_timeout) {
+					ESP_LOGI(TAG, "計測データを %lu 秒間受信していません。再接続します", (esphome::millis() - rejoin_timer) / 1000);
+					restart_connection(false);
+					break;
+				}
+				if (reboot_timeout && esphome::millis() - reboot_timer > reboot_timeout) {
+					ESP_LOGE(TAG, "計測データを %lu 秒間受信していません。再起動します", (esphome::millis() - reboot_timer) / 1000);
+					set_state(state_t::restarting, 0);
+					break;
+				}
+			}
+			break;
 		case state_t::restarting:
 			if (esphome::millis() - state_started >= RESTART_DELAY) {
 				mark_failed();
 				App.safe_reboot();
 			}
-			return;  // DO NOT DO ANYTHING
-		case state_t::init:
-			bp.send_sk("SKVER");
-			set_state(state_t::wait_ver, 1'000);
-			break;
-		case state_t::wait_ver:
-			if (ev == event_t::ver) {
-				ESP_LOGD(TAG, "VER=%s", params.remain.data());
-			} else if (ev == event_t::ok) {
-				// disable echo back
-				bp.send_sk("SKSREG", arg::reg(0xfe), arg::mode(0));
-				set_state(state_t::setting_values, 1'000);
-				setting_value = initial_value_t::echo;
-			}
-			break;
-		case state_t::setting_values:
-			if (ev == event_t::ok) {
-				switch (setting_value) {
-					case initial_value_t::echo:
-						// test binary mode
-						bp.send_prod("ROPT");
-						setting_value = initial_value_t::ropt;
-						break;
-					case initial_value_t::ropt:
-						ESP_LOGD(TAG, "ropt=%s", params.remain.data());
-						if (params.remain != "01") {
-							// set to ascii mode
-							bp.send_prod("WOPT", arg::num8(1));
-							setting_value = initial_value_t::wopt;
-							break;
-						} else {
-							[[fallthrough]];
-						}
-					case initial_value_t::wopt:
-						bp.send_sk("SKSETPWD", arg::num8(std::strlen(rb_password)), arg::str(rb_password));
-						set_state(state_t::setting_values, 1'000);
-						setting_value = initial_value_t::pwd;
-						break;
-					case initial_value_t::pwd:
-						bp.send_sk("SKSETRBID", arg::str(rb_id));
-						setting_value = initial_value_t::rbid;
-						break;
-					case initial_value_t::rbid:
-						start_scan();
-						break;
-					case initial_value_t::channel:
-						bp.send_sk("SKSREG", arg::reg(0x03), arg::str(panid));
-						setting_value = initial_value_t::panid;
-						break;
-					case initial_value_t::panid:
-						start_join();
-						break;
-					default:
-						ESP_LOGE(TAG, "%d: Unexpected setting value type", static_cast<int>(setting_value));
-						break;
-				}
-			}
-			break;
-		case state_t::addr_conv:
-			if (ev == event_t::unknown) {
-				if (params.line.rfind("SKLL", 0) == 0) {
-					break;
-				}
-				if (params.line.length() == 39) {
-					v6_address = params.line;
-					bp.send_sk("SKSREG", arg::reg(0x02), arg::str(channel));
-					setting_value = initial_value_t::channel;
-					set_state(state_t::setting_values, 1'000);
-				}
-			}
-			break;
-		case state_t::scanning:
-			if (ev == event_t::ok) {
-				ESP_LOGI(TAG, "Scanning...");
-			} else if (ev == event_t::event && params.event.num == 0x22) {
-				if (test_nw_info()) {
-					ESP_LOGI(TAG, "Scan done");
-					rescan_timer = esphome::millis();
-					bp.send_sk("SKLL64", arg::str(mac));
-					set_state(state_t::addr_conv, 1'000);
-				} else {
-					ESP_LOGW(TAG, "Scan done but channel not received, scan again");
-					start_scan();
-				}
-				break;
-			} else if (ev == event_t::unknown && params.line[0] == ' ') {
-				auto line = util::trim_sv(params.line);
-				if (line.rfind(SCAN_KEY_ADDR, 0) == 0) {
-					mac = line.substr(SCAN_KEY_ADDR.length());
-				} else if (line.rfind(SCAN_KEY_PANID, 0) == 0) {
-					panid = line.substr(SCAN_KEY_PANID.length());
-				} else if (line.rfind(SCAN_KEY_CHANNEL, 0) == 0) {
-					channel = line.substr(SCAN_KEY_CHANNEL.length());
-				}
-			}
-			break;
-		case state_t::joining:
-			if (ev == event_t::ok) {
-				ESP_LOGI(TAG, "Joining...");
-			} else if (ev == event_t::event) {
-				if (params.event.num == 0x25) {
-					ESP_LOGI(TAG, "Joined");
-					set_state(state_t::running, 0);
-					rejoin_timer = esphome::millis();
-				} else if (params.event.num == 0x24) {
-					ESP_LOGW(TAG, "Failed to join, try scan and join");
-					start_scan();
-				} else {
-					if (params.event.num != 0x21) {
-						ESP_LOGD(TAG, "%02x: Ignore event", params.event.num);
-					}
-				}
-			}
-			break;
-		case state_t::running: {
-			switch (ev) {
-				case event_t::event:
-					switch (params.event.num) {
-						case 0x32:
-							ESP_LOGW(TAG, "Transmit time limit activated");
-							break;
-						case 0x33:
-							ESP_LOGW(TAG, "Transmit time limit cleared");
-							break;
-						case 0x29:
-							ESP_LOGI(TAG, "Session expired, waiting re-join");
-							set_state(state_t::joining, 10'000);
-							break;
-						default:
-							ESP_LOGV(TAG, "%02x: Unhandled event", params.event.num);
-							break;
-					}
-					break;
-				case event_t::rxudp:
-					handle_rxudp(params.remain);
-					break;
-				case event_t::none:
-					break;
-				default:
-					ESP_LOGV(TAG, "%d: Unhandled input", static_cast<int>(ev));
-					break;
-			}
-			if (rescan_timeout && is_measurement_requesting()) {
-				if (auto elapsed = esphome::millis() - rescan_timer; elapsed > rescan_timeout) {
-					ESP_LOGE(TAG, "計測データを %lu 秒間受信していません。再スキャンします", elapsed / 1000);
-					start_scan();
-					break;
-				}
-			}
-			if (rejoin_timeout && is_measurement_requesting()) {
-				if (auto elapsed = esphome::millis() - rejoin_timer; elapsed > rejoin_timeout) {
-					ESP_LOGI(TAG, "計測データを %lu 秒間受信していません。再接続します", elapsed / 1000);
-					start_join();
-					break;
-				}
-			}
-		} break;
-		default:
-			ESP_LOGD(TAG, "%d: Unhandled state", static_cast<int>(state));
-			break;
-	}
-	if (reboot_timeout && is_measurement_requesting()) {
-		if (auto elapsed = esphome::millis() - reboot_timer; elapsed > reboot_timeout) {
-			ESP_LOGE(TAG, "計測データを %lu 秒間受信していません。再起動します", elapsed / 1000);
-			set_state(state_t::restarting, 0);
 			return;
-		}
+		default:
+			break;
 	}
-	if (state_timeout && esphome::millis() - state_started > state_timeout) {
-		ESP_LOGW(TAG, "%s: State timeout, re-run from init", state_name(state));
-		set_state(state_t::init, 0);
+
+	// State timeout (per state)
+	if (state == state_t::init) {
+		if (state_timeout && esphome::millis() - state_started > state_timeout) {
+			set_state(state_t::set_mode);
+		}
+	} else if (state != state_t::restarting && state != state_t::running) {
+		if (state_timeout && esphome::millis() - state_started > state_timeout) {
+			ESP_LOGW(TAG, "%s: state timeout, reconnect", state_name(state));
+			restart_connection(false);
+		}
 	}
 }
 

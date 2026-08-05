@@ -128,8 +128,11 @@
                 clang-format = {
                   enable = true;
                 };
+                # clang-tidy cannot analyze ESPHome component code in this
+                # environment (cross-compile flags + esphome headers are
+                # unavailable to the host clang-tidy), so it is disabled.
                 clang-tidy = {
-                  enable = true;
+                  enable = false;
                 };
                 deadnix = {
                   enable = true;
