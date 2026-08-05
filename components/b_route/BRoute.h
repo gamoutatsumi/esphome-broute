@@ -2,6 +2,7 @@
 #include <esphome/components/sensor/sensor.h>
 #include <esphome/components/uart/uart.h>
 #include <esphome/core/component.h>
+#include <esphome/core/gpio.h>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -32,6 +33,7 @@ class BRoute : public Component, public uart::UARTDevice, public j11::SerialIO {
 		rb_id = id;
 		rb_password = password;
 	}
+	void set_reset_pin(GPIOPin* pin) { reset_pin = pin; }
 
 	// j11::SerialIO
 	virtual size_t write(const uint8_t* data, size_t len) override {
@@ -93,16 +95,17 @@ class BRoute : public Component, public uart::UARTDevice, public j11::SerialIO {
 	uint8_t meter_mac[8] = {0};
 	uint8_t meter_ipv6[16] = {0};
 	bool channel_found = false;
-	bool request_sent = false;    // current state already sent its request
-	bool need_scan_ = true;       // perform active scan during connection
-	bool awaiting_boot_ = false;  // waiting for boot-complete after HW reset
-	uint16_t expected_resp = 0;   // response command code awaited by simple states
+	bool request_sent = false;     // current state already sent its request
+	bool need_scan_ = true;        // perform active scan during connection
+	uint16_t expected_resp = 0;    // response command code awaited by simple states
+	GPIOPin* reset_pin = nullptr;  // BP35C1-J11-T01 RESETN (active-low, optional)
 
 	std::array<std::byte, 255> out_buffer{};
 	std::array<uint8_t, 64> tx_buffer{};
 
 	void set_state(state_t state, uint32_t timeout = 0);
-	void restart_connection(bool with_scan);  // HW reset → boot → reconnect (rescan when true)
+	void restart_connection(bool with_scan);  // reset → boot → reconnect (rescan when true)
+	void do_hardware_reset();                 // pulse RESETN pin if configured
 	static const char* state_name(state_t);
 
 	bool handle_simple_response(const j11::Frame& frame, state_t ok_state);

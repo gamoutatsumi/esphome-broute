@@ -15,7 +15,7 @@ namespace meter = echonet_lite::props::lowv_smart_meter;
 
 namespace {
 
-constexpr uint32_t BOOT_WAIT = 3'000;
+constexpr uint32_t BOOT_WAIT = 5'000;
 constexpr uint32_t RESP_TIMEOUT = 5'000;
 constexpr uint32_t SCAN_TIMEOUT = 30'000;
 constexpr uint32_t BROUTE_START_TIMEOUT = 10'000;
@@ -108,7 +108,24 @@ BRoute::setup() {
 	if (energy_sensor && energy_sensor_interval) {
 		set_interval(energy_sensor_interval, [this] { request_integral_energy(); });
 	}
+	if (reset_pin != nullptr) {
+		reset_pin->setup();              // configure as output
+		reset_pin->digital_write(true);  // idle HIGH (RESETN de-asserted)
+	}
 	reset_timers();
+}
+
+void
+BRoute::do_hardware_reset() {
+	if (reset_pin == nullptr) {
+		return;
+	}
+	// RESETN is active-low: pulse LOW then release HIGH
+	reset_pin->digital_write(false);
+	esphome::delay(100);
+	reset_pin->digital_write(true);
+	esphome::delay(500);
+	ESP_LOGI(TAG, "RESETN pulse");
 }
 
 bool
@@ -171,10 +188,7 @@ BRoute::restart_connection(bool with_scan) {
 		channel = j11::CHANNEL_UNSPEC;
 		channel_found = false;
 	}
-	driver.reset_rx();
-	awaiting_boot_ = true;
-	// ソフトウェアリセット → 起動完了通知(0x6019)待ち → 初期設定から再開
-	driver.send_request(cmd::HW_RESET);
+	// init 状態でリセット(RESETN パルス + 0x00D9)→起動完了通知待ち→初期設定から再開
 	set_state(state_t::init, BOOT_WAIT);
 }
 
@@ -412,8 +426,17 @@ BRoute::loop() {
 
 	switch (state) {
 		case state_t::init:
-			if (!awaiting_boot_) {
-				set_state(state_t::set_mode);
+			// 初回突入時のみ: モジュールを確実に未起動状態にするため RESETN パルス +
+			// ソフトウェアリセット(0x00D9)を行い、起動完了通知(0x6019)を待つ。
+			// (ESP32 再起動後もモジュールが前回状態を保持している場合があり、
+			//  初期設定は全体未起動状態でしか実行できないため)
+			if (!request_sent) {
+				do_hardware_reset();
+				driver.reset_rx();
+				driver.send_request(cmd::HW_RESET);
+				request_sent = true;
+				state_started = esphome::millis();
+				state_timeout = BOOT_WAIT;
 				break;
 			}
 			if (have && frame.command == notif::BOOT_COMPLETE) {
