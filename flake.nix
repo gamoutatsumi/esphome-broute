@@ -86,6 +86,7 @@
                 packages = with pkgs; [
                   esphome
                   clang-tools
+                  uv
                 ];
                 inputsFrom = [
                   config.pre-commit.devShell
