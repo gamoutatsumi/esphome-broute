@@ -448,8 +448,8 @@ BRoute::loop() {
 			if (!request_sent) {
 				expected_resp = cmd::INITIAL_SETTING | 0x2000;
 				if (send_initial_setting(channel)) {
-					request_sent = true;
 					set_state(state_t::set_mode, RESP_TIMEOUT);
+					request_sent = true;
 				}
 			} else if (have) {
 				handle_simple_response(frame, state_t::set_auth);
@@ -459,8 +459,8 @@ BRoute::loop() {
 			if (!request_sent) {
 				expected_resp = cmd::BROUTE_SET_AUTH | 0x2000;
 				if (send_broute_auth()) {
-					request_sent = true;
 					set_state(state_t::set_auth, RESP_TIMEOUT);
+					request_sent = true;
 				}
 			} else if (have) {
 				handle_simple_response(frame, need_scan_ ? state_t::scan : state_t::broute_start);
@@ -469,8 +469,8 @@ BRoute::loop() {
 		case state_t::scan: {
 			if (!request_sent) {
 				if (send_active_scan()) {
-					request_sent = true;
 					set_state(state_t::scan, SCAN_TIMEOUT);
+					request_sent = true;
 				}
 				break;
 			}
@@ -498,8 +498,8 @@ BRoute::loop() {
 			if (!request_sent) {
 				expected_resp = cmd::INITIAL_SETTING | 0x2000;
 				if (send_initial_setting(channel)) {
-					request_sent = true;
 					set_state(state_t::set_channel, RESP_TIMEOUT);
+					request_sent = true;
 				}
 			} else if (have) {
 				handle_simple_response(frame, state_t::broute_start);
@@ -509,8 +509,8 @@ BRoute::loop() {
 			if (!request_sent) {
 				expected_resp = cmd::BROUTE_START | 0x2000;
 				if (send_broute_start()) {
-					request_sent = true;
 					set_state(state_t::broute_start, BROUTE_START_TIMEOUT);
+					request_sent = true;
 				}
 			} else if (have && frame.command == expected_resp) {
 				if (frame.result() == j11::RESULT_OK) {
@@ -533,8 +533,8 @@ BRoute::loop() {
 			if (!request_sent) {
 				expected_resp = cmd::UDP_PORT_OPEN | 0x2000;
 				if (send_udp_open()) {
-					request_sent = true;
 					set_state(state_t::open_udp, RESP_TIMEOUT);
+					request_sent = true;
 				}
 			} else if (have) {
 				handle_simple_response(frame, state_t::pana_start);
@@ -544,8 +544,8 @@ BRoute::loop() {
 			if (!request_sent) {
 				expected_resp = cmd::BROUTE_PANA_START | 0x2000;
 				if (send_pana_start()) {
-					request_sent = true;
 					set_state(state_t::pana_start, RESP_TIMEOUT);
+					request_sent = true;
 				}
 			} else if (have) {
 				handle_simple_response(frame, state_t::pana_wait);
