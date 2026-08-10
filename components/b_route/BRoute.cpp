@@ -433,7 +433,6 @@ BRoute::loop() {
 			if (!request_sent) {
 				do_hardware_reset();
 				driver.reset_rx();
-				driver.send_request(cmd::HW_RESET);
 				request_sent = true;
 				state_started = esphome::millis();
 				state_timeout = BOOT_WAIT;
