@@ -91,7 +91,7 @@ class BRoute : public Component, public uart::UARTDevice, public j11::SerialIO {
 	uint32_t reboot_timeout = 0;
 	uint8_t rejoin_miss_count = 0;
 
-	uint8_t channel = j11::CHANNEL_UNSPEC;  // smart meter channel (scanned)
+	uint8_t channel = j11::CHANNEL_DEFAULT;  // smart meter channel (scanned)
 	uint8_t meter_mac[8] = {0};
 	uint8_t meter_ipv6[16] = {0};
 	bool channel_found = false;

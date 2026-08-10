@@ -49,7 +49,7 @@ constexpr uint16_t ERR_HEADER_CS = 0x2FFF;
 
 // Initial setting values (表20)
 constexpr uint8_t MODE_DUAL = 0x05;
-constexpr uint8_t CHANNEL_UNSPEC = 0xFF;
+constexpr uint8_t CHANNEL_DEFAULT = 0x04;
 constexpr uint8_t TX_POWER_20MW = 0x00;
 constexpr uint8_t HAN_SLEEP_DISABLE = 0x00;
 

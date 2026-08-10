@@ -185,7 +185,7 @@ BRoute::restart_connection(bool with_scan) {
 	ESP_LOGW(TAG, "Reconnect (rescan=%d)", with_scan ? 1 : 0);
 	need_scan_ = with_scan;
 	if (with_scan) {
-		channel = j11::CHANNEL_UNSPEC;
+		channel = j11::CHANNEL_DEFAULT;
 		channel_found = false;
 	}
 	// init 状態でリセット(RESETN パルス + 0x00D9)→起動完了通知待ち→初期設定から再開
